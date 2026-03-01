@@ -1,4 +1,4 @@
-name: repaint-env
+name: DeepProject
 channels:
   - pytorch
   - nvidia
