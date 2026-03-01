@@ -28,8 +28,8 @@ from tqdm import tqdm
 # =============================================================================
 
 def load_pipeline_components(
-    model_id: str = "stabilityai/stable-diffusion-2-base",
-    device: str = "cuda"
+        model_id: str = "sd2-community/stable-diffusion-2-base",
+        device: str = "cuda"
 ):
     """
     Load all SD2 components individually so we have full manual control
@@ -125,9 +125,9 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
 # =============================================================================
 
 def encode_image_to_latent(
-    image_tensor: torch.Tensor,
-    vae: AutoencoderKL,
-    device: str
+        image_tensor: torch.Tensor,
+        vae: AutoencoderKL,
+        device: str
 ) -> torch.Tensor:
     """
     Compress a pixel-space image into VAE latent space.
@@ -147,9 +147,9 @@ def encode_image_to_latent(
 
 
 def decode_latent_to_image(
-    latent: torch.Tensor,
-    vae: AutoencoderKL,
-    device: str
+        latent: torch.Tensor,
+        vae: AutoencoderKL,
+        device: str
 ) -> Image.Image:
     """
     Decompress a VAE latent back to pixel-space image.
@@ -176,10 +176,10 @@ def decode_latent_to_image(
 # =============================================================================
 
 def encode_text_prompt(
-    prompt: str,
-    tokenizer: CLIPTokenizer,
-    text_encoder: CLIPTextModel,
-    device: str
+        prompt: str,
+        tokenizer: CLIPTokenizer,
+        text_encoder: CLIPTextModel,
+        device: str
 ) -> torch.Tensor:
     """
     Encode text prompt into CLIP embeddings for Classifier-Free Guidance (CFG).
@@ -215,15 +215,15 @@ def encode_text_prompt(
 # =============================================================================
 
 def repaint_inpainting(
-    image: Image.Image,
-    mask,
-    prompt: str,
-    model_id: str        = "stabilityai/stable-diffusion-2-base",
-    num_inference_steps: int   = 50,
-    guidance_scale: float      = 7.5,
-    seed: int                  = 42,
-    resolution: int            = 512,
-    device: str                = "cuda"
+        image: Image.Image,
+        mask,
+        prompt: str,
+        model_id: str        = "sd2-community/stable-diffusion-2-base",
+        num_inference_steps: int   = 50,
+        guidance_scale: float      = 7.5,
+        seed: int                  = 42,
+        resolution: int            = 512,
+        device: str                = "cuda"
 ) -> Image.Image:
     """
     Perform RePaint-style inpainting using Stable Diffusion 2.
@@ -376,8 +376,8 @@ def repaint_inpainting(
             # Re-noise the original to level t-1:
             # more noise early (t large), less noise late (t small)
             original_at_t_minus_1 = (
-                (alpha_bar_prev ** 0.5)       * original_latent +
-                ((1 - alpha_bar_prev) ** 0.5) * noise
+                    (alpha_bar_prev ** 0.5)       * original_latent +
+                    ((1 - alpha_bar_prev) ** 0.5) * noise
             )
         else:
             # At the very last step (t=0), use the clean original directly

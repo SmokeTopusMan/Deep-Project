@@ -6,15 +6,14 @@ channels:
   - defaults
 dependencies:
   - python=3.10
-  - pytorch
-  - torchvision
-  - pytorch-cuda=12.1
-  - numpy
+  - numpy=1.26.4
   - pillow
   - tqdm
   - pip
   - pip:
-      - diffusers
-      - transformers
+      - torch==2.5.1+cu124
+      - torchvision==0.20.1+cu124
+      - diffusers==0.30.0
+      - transformers==4.44.0
       - accelerate
       - safetensors
