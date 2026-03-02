@@ -2,7 +2,7 @@
 RePaint-Style Inpainting Pipeline — Stable Diffusion 2.
 
 Mask convention:
-    PIL Image : BLACK = inpaint, WHITE = keep
+    PIL Image : WHITE = inpaint, BLACK = keep
     Numpy arr : 1 = inpaint, 0 = keep
 """
 
@@ -58,10 +58,10 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
     else:
-        # PIL: black(0) -> 1=inpaint, white(255) -> 0=keep
+        # PIL: white(255) -> 1=inpaint, black(0) -> 0=keep
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr < 0.5).astype(np.float32)
+        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
@@ -79,7 +79,7 @@ def preprocess_mask_pixel(mask, resolution: int = 512) -> torch.Tensor:
     else:
         pil_mask = mask.convert("L").resize((resolution, resolution), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr < 0.5).astype(np.float32)
+        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
@@ -124,27 +124,27 @@ def encode_text_prompt(prompt: str, tokenizer: CLIPTokenizer, text_encoder: CLIP
 
 def postprocess(result_image: Image.Image, original_image: Image.Image, mask, resolution: int = 512) -> Image.Image:
     """
-    Hard pixel swap: for every pixel where mask is NOT black, replace the
+    Hard pixel swap: for every pixel where mask is NOT white, replace the
     result pixel with the exact original pixel, regardless of result value.
-    Black mask pixels (inpaint region) are left untouched.
+    White mask pixels (inpaint region) are left untouched.
     """
     # Resize both images to pipeline resolution
     orig_np   = np.array(original_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
     result_np = np.array(result_image)
 
-    # Build binary bitmap from mask: black pixel (all channels ~0) -> 1=inpaint, else 0=keep
+    # Build binary bitmap from mask
     if isinstance(mask, np.ndarray):
         mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
     else:
         mask_pil = mask.convert("RGB")
     mask_np = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
 
-    # A pixel is "black" (inpaint) if all channels are below threshold 10
-    is_black = np.all(mask_np < 10, axis=2)  # (H, W) bool, True=inpaint
+    # CHANGED: A pixel is "white" (inpaint) if all channels are above threshold 250
+    is_white = np.all(mask_np > 250, axis=2)  # (H, W) bool, True=inpaint
 
-    # Hard swap: wherever is_black is False (keep region), use original pixel exactly
+    # Hard swap: wherever is_white is False (keep region), use original pixel exactly
     output_np = result_np.copy()
-    output_np[~is_black] = orig_np[~is_black]
+    output_np[~is_white] = orig_np[~is_white]
 
     return Image.fromarray(output_np)
 
@@ -167,7 +167,7 @@ def repaint_inpainting(
     """
     Args:
         image               : Original PIL image
-        mask                : PIL image (black=inpaint) or numpy array (1=inpaint)
+        mask                : PIL image (white=inpaint) or numpy array (1=inpaint)
         prompt              : Text describing what to generate in the masked region
         tokenizer/text_encoder/vae/unet/scheduler: pre-loaded model components
         num_inference_steps : Reverse diffusion steps (more = better quality, slower)
@@ -268,7 +268,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — batch directory mode")
     parser.add_argument("--images_dir",  type=str, required=True,     help="Directory of input images (.jpg/.png)")
-    parser.add_argument("--masks_dir",   type=str, required=True,     help="Directory of mask images (black=inpaint, white=keep)")
+    parser.add_argument("--masks_dir",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
     parser.add_argument("--prompts_dir", type=str, required=True,     help="Directory of prompt .txt files")
     parser.add_argument("--output_dir",  type=str, default="results", help="Directory to save results")
     parser.add_argument("--steps",       type=int,   default=50,      help="Diffusion steps (default: 50)")
