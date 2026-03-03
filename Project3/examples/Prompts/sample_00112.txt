@@ -1,1 +1,1 @@
-A train which is part of the Metropolitan Transit System.
+A bus which is part of the Metropolitan Transit System.

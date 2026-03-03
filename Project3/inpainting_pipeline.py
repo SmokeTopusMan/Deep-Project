@@ -267,21 +267,21 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — batch directory mode")
-    parser.add_argument("--images_dir",  type=str, required=True,     help="Directory of input images (.jpg/.png)")
-    parser.add_argument("--masks_dir",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
-    parser.add_argument("--prompts_dir", type=str, required=True,     help="Directory of prompt .txt files")
-    parser.add_argument("--output_dir",  type=str, default="results", help="Directory to save results")
+    parser.add_argument("--images",  type=str, required=True,     help="Directory of input images (.jpg/.png)")
+    parser.add_argument("--masks",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
+    parser.add_argument("--prompts", type=str, required=True,     help="Directory of prompt .txt files")
+    parser.add_argument("--output",  type=str, default="results", help="Directory to save results")
     parser.add_argument("--steps",       type=int,   default=50,      help="Diffusion steps (default: 50)")
     parser.add_argument("--guidance",    type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
     parser.add_argument("--seed",        type=int,   default=42,      help="Random seed (default: 42)")
     parser.add_argument("--device",      type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
+    output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print("Scanning directories for matching triplets...")
-    triplets = load_triplets(args.images_dir, args.masks_dir, args.prompts_dir)
+    triplets = load_triplets(args.images, args.masks, args.prompts)
 
     print("Loading model (this happens once for all images)...")
     tokenizer, text_encoder, vae, unet, scheduler = load_pipeline_components(device=args.device)

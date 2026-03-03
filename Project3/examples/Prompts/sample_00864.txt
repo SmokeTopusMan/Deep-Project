@@ -1,1 +1,1 @@
-A stoplight that is flashing red lights at cars.
+A stoplight that is flashing green lights at cars.
