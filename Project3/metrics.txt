@@ -1,0 +1,51 @@
+Metric: PSNR (GT)
+Value: Higher = closer pixel reconstruction to ground truth (dB).
+Why: Fast sanity check for pixel-level accuracy.
+
+Metric: SSIM (GT)
+Value: Higher = better structural similarity (edges/contrast/structure) to ground truth, usually [0,1].
+Why: Captures structural correctness better than raw pixel metrics.
+
+Metric: LPIPS (GT)
+Value: Lower = more perceptually similar to ground truth (deep feature distance).
+Why: Best “looks similar” metric; correlates better with human judgment.
+
+Metric: Boundary PSNR (GT)
+Value: Higher = pixel fidelity, computed only in a narrow border band around mask edge.
+Why: Directly measures seam errors near the mask boundary.
+
+Metric: Boundary SSIM (GT)
+Value: Higher = structural continuity near the mask edge (border band only).
+Why: Evaluates structure alignment at the seam (where artifacts are most visible).
+
+Metric: Boundary LPIPS (GT)
+Value: Lower = perceptual seam quality near the boundary (border band only).
+Why: Strong indicator of visible seam artifacts.
+
+Metric: Boundary Gradient L1 (GT)
+Value: Lower = closer edge/gradient behavior to GT near the boundary.
+Why: Detects halos, ringing, blur, and edge discontinuities.
+
+Metric: Prompt-Image CLIP Similarity (No-GT)
+Value: Higher = prompt and image are more semantically aligned (cosine similarity in CLIP space).
+Why: Measures whether your inpaint content matches the prompt meaning.
+
+Metric: NIQE (No-GT)
+Value: Lower = more “natural” looking image according to natural image statistics.
+Why: Detects synthetic artifacts without any ground truth.
+
+Metric: BRISQUE (No-GT)
+Value: Lower = fewer distortions / artifacts (blind quality assessment).
+Why: Another no-reference artifact detector; complements NIQE.
+
+Metric: ImageReward (No-GT)
+Value: Higher = better quality/alignment per a learned human preference model.
+Why: Often correlates with human preference for text-guided images.
+
+Metric: Border Leakage MAE (No-GT)
+Value: Lower = output matches the original on the KEEP side near the border (outside-mask band).
+Why: Detects “bleeding” / unintended changes outside the mask.
+
+Metric: Border Gradient Jump (No-GT)
+Value: Lower = smoother gradient continuity across the seam (difference between inside-band and outside-band gradients).
+Why: Measures seam harshness even without GT.

@@ -1,0 +1,16 @@
+This is a txt file that will contain the journey we made during this project.
+in order to maintain structure and remember what we did and why for the final report file.
+
+
+Meaningful links:
+dataset link: InpaintCOCO- https://huggingface.co/datasets/phiyodr/InpaintCOCO
+
+
+summary up until 2.3
+we build the main vanilla pipeline script that was required in Project 3 and ran it on a couple of photos we took.
+than we chose the Inpaint-COCO dataset we found on hugging-face(recommended by ai) and ran the vanilla pipeline on it..
+
+
+3.3-ohad: I added metrics to the script to measure the current performance of the pipeline, with the help of GPT decided on
+a couple of metrics we would use, we also decided to try and make the model better at smoother borders between the mask and unmasked areas
+so i decided to use the same metrics for overall performance, but use them precisly on the sections in the image that are between the border and the mask

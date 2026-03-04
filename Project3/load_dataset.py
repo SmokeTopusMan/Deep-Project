@@ -36,7 +36,7 @@ def main():
         # Save Prompt (Text file)
         prompt_path = os.path.join(args.prompts, f"{file_basename}.txt")
         with open(prompt_path, "w", encoding="utf-8") as f:
-            f.write(item["inpaint_caption"])
+            f.write(item["coco_caption"])
 
     print(f"\nDone! Data saved to:\n- {args.images}\n- {args.masks}\n- {args.prompts}")
 

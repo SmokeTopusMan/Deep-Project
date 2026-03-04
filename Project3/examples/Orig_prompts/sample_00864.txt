@@ -1,0 +1,1 @@
+A stoplight that is flashing green lights at cars.

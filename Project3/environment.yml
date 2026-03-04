@@ -11,9 +11,20 @@ dependencies:
   - tqdm
   - pip
   - pip:
-      - torch==2.5.1+cu124
-      - torchvision==0.20.1+cu124
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1
+      - torchvision==0.20.1
       - diffusers==0.30.0
       - transformers==4.44.0
       - accelerate
       - safetensors
+      - torchmetrics 
+      - piq
+      - clean-fid
+      - torch-fidelity
+      - scikit-image
+      - image-reward
+      - opencv-contrib-python
+      - datasets
+      - pyiqa
+      - brisque

@@ -13,6 +13,7 @@ from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
 from tqdm import tqdm
 from pathlib import Path
+from evaluator import InpaintingEvaluator, EvaluatorConfig, CSVLogger
 
 
 def load_pipeline_components(
@@ -61,9 +62,18 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         # PIL: white(255) -> 1=inpaint, black(0) -> 0=keep
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
+        arr = (arr > 0.5).astype(np.float32)
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+
+### THIS IS THE FIRST IDEA OF IMPROVEMENT:
+# what we will do is create a bigger mask at the start of the pipeline and ake it smaller as the repainting goes on.
+#------------------------------------------------------------------------------------------------------------------------
+def bigmask(mask, r=1):
+    k = 2*r + 1
+    return torch.nn.functional.max_pool2d(mask, kernel_size=k, stride=1, padding=r)
+#------------------------------------------------------------------------------------------------------------------------
+
 
 
 def preprocess_mask_pixel(mask, resolution: int = 512) -> torch.Tensor:
@@ -79,7 +89,7 @@ def preprocess_mask_pixel(mask, resolution: int = 512) -> torch.Tensor:
     else:
         pil_mask = mask.convert("L").resize((resolution, resolution), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
+        arr = (arr > 0.5).astype(np.float32)
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
@@ -139,7 +149,7 @@ def postprocess(result_image: Image.Image, original_image: Image.Image, mask, re
         mask_pil = mask.convert("RGB")
     mask_np = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
 
-    # CHANGED: A pixel is "white" (inpaint) if all channels are above threshold 250
+    # A pixel is "white" (inpaint) if all channels are above threshold 250
     is_white = np.all(mask_np > 250, axis=2)  # (H, W) bool, True=inpaint
 
     # Hard swap: wherever is_white is False (keep region), use original pixel exactly
@@ -158,6 +168,7 @@ def repaint_inpainting(
         vae,
         unet,
         scheduler,
+        clean=True,
         num_inference_steps: int  = 50,
         guidance_scale: float     = 7.5,
         seed: int                 = 42,
@@ -181,14 +192,24 @@ def repaint_inpainting(
 
     image_tensor    = preprocess_image(image, resolution)
     mask_latent     = preprocess_mask(mask, resolution).to(device)
+    #change for idea1
+    mask_orig = mask_latent
+    mask_big  = bigmask(mask_orig, r=1)
+    #---------------------------------------
     original_latent = encode_image_to_latent(image_tensor, vae, device)
     text_embeddings = encode_text_prompt(prompt, tokenizer, text_encoder, device)
+
 
     # Start from pure Gaussian noise (x_T), cast to model dtype (fp16 on CUDA)
     x_t = torch.randn(original_latent.shape, generator=generator, device=device, dtype=unet.dtype)
     x_t = x_t * scheduler.init_noise_sigma
 
-    for t in tqdm(scheduler.timesteps, desc="Inpainting"):
+    #added step count for 1st idea.
+    timesteps = list(scheduler.timesteps)
+    for step, t in enumerate(tqdm(timesteps, desc="Inpainting")):
+        #Hardcoded threshold to use the bigger mask just for now.
+        bigsteps = 25
+        mask_t = mask_big if step < bigsteps and not clean else mask_orig
 
         # CFG: run UNet with both conditional and unconditional embeddings in one pass
         unet_input = scheduler.scale_model_input(torch.cat([x_t, x_t], dim=0), t)
@@ -203,7 +224,7 @@ def repaint_inpainting(
         # Scheduler step: remove predicted noise to get x_{t-1}
         x_t_minus_1 = scheduler.step(noise_pred, t, x_t).prev_sample
 
-        # Re-noise original to level t-1: x_{t-1} = sqrt(a)*x0 + sqrt(1-a)*eps
+        # Re-noise original to level t-1
         current_idx = (scheduler.timesteps == t).nonzero().item()
         t_prev = scheduler.timesteps[current_idx + 1].item() if current_idx + 1 < len(scheduler.timesteps) else 0
         alpha_bar_prev = scheduler.alphas_cumprod[t_prev]
@@ -215,7 +236,7 @@ def repaint_inpainting(
             original_at_t_minus_1 = original_latent
 
         # RePaint blend: masked region from UNet, unmasked from re-noised original
-        x_t = (mask_latent * x_t_minus_1) + ((1 - mask_latent) * original_at_t_minus_1)
+        x_t = (mask_t * x_t_minus_1) + ((1 - mask_t) * original_at_t_minus_1)
 
     result_image = decode_latent_to_image(x_t, vae, device)
 
@@ -275,6 +296,17 @@ if __name__ == "__main__":
     parser.add_argument("--guidance",    type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
     parser.add_argument("--seed",        type=int,   default=42,      help="Random seed (default: 42)")
     parser.add_argument("--device",      type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
+    #easy to change between clean and modified pipeline
+    parser.add_argument("--clean", action="store_true", default=True , help="Use original RePaint pipeline without bigmask")
+    # Metrics / evaluation
+    parser.add_argument("--metrics_csv", type=str, default="metrics.csv", help="Where to save per-image metrics CSV")
+    parser.add_argument("--band_px", type=int, default=10, help="Boundary band width in pixels for border metrics")
+    parser.add_argument("--no_brisque", action="store_true", help="Disable BRISQUE (requires opencv-contrib-python)")
+    parser.add_argument("--no_imagereward", action="store_true", help="Disable ImageReward (requires image-reward)")
+
+    # Cap number of images processed (0 = all)
+    parser.add_argument("--max_images", type=int, default=0, help="Max number of images to process (0 = all)")
+
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -283,31 +315,103 @@ if __name__ == "__main__":
     print("Scanning directories for matching triplets...")
     triplets = load_triplets(args.images_dir, args.masks_dir, args.prompts_dir)
 
+    # Apply cap
+    to_run = triplets if args.max_images <= 0 else triplets[:args.max_images]
+    print(f"Running on {len(to_run)}/{len(triplets)} triplets (cap={args.max_images})")
+
     print("Loading model (this happens once for all images)...")
     tokenizer, text_encoder, vae, unet, scheduler = load_pipeline_components(device=args.device)
 
-    for i, triplet in enumerate(triplets):
+    # Create evaluator + CSV logger (uses evaluator.py)
+    cfg = EvaluatorConfig(
+        device=args.device,
+        band_px=args.band_px,
+        enable_brisque=not args.no_brisque,
+        enable_imagereward=not args.no_imagereward,
+    )
+    evaluator = InpaintingEvaluator(cfg)
+    logger = CSVLogger(args.metrics_csv)
+    print(f"Logging metrics to: {args.metrics_csv}")
+
+    all_scores = []  # keep for end-of-run summary
+
+    for i, triplet in enumerate(to_run):
         name, image, mask, prompt = triplet["name"], triplet["image"], triplet["mask"], triplet["prompt"]
-        print(f"\n[{i+1}/{len(triplets)}] Processing '{name}' ...")
+        print(f"\n[{i+1}/{len(to_run)}] Processing '{name}' ...")
         print(f"  Prompt: \"{prompt}\"")
+        if args.clean:
+            result = repaint_inpainting(
+                image               = image,
+                mask                = mask,
+                prompt              = prompt,
+                tokenizer           = tokenizer,
+                text_encoder        = text_encoder,
+                vae                 = vae,
+                unet                = unet,
+                scheduler           = scheduler,
+                num_inference_steps = args.steps,
+                guidance_scale      = args.guidance,
+                seed                = args.seed,
+                device              = args.device
+            )
+        else:
+            result = repaint_inpainting(
+                image               = image,
+                mask                = mask,
+                prompt              = prompt,
+                tokenizer           = tokenizer,
+                text_encoder        = text_encoder,
+                vae                 = vae,
+                unet                = unet,
+                scheduler           = scheduler,
+                clean               = False,
+                num_inference_steps = args.steps,
+                guidance_scale      = args.guidance,
+                seed                = args.seed,
+                device              = args.device
+            )
 
-        result = repaint_inpainting(
-            image               = image,
-            mask                = mask,
-            prompt              = prompt,
-            tokenizer           = tokenizer,
-            text_encoder        = text_encoder,
-            vae                 = vae,
-            unet                = unet,
-            scheduler           = scheduler,
-            num_inference_steps = args.steps,
-            guidance_scale      = args.guidance,
-            seed                = args.seed,
-            device              = args.device
-        )
-
-        out_path = output_dir / f"{name}_result.png"
+        if args.clean:
+            out_path = output_dir / f"{name}_result.png"
+        else:
+            out_path = output_dir / f"{name}_result_bigmask.png"
         result.save(out_path)
         print(f"  Saved -> {out_path}")
+
+        # Ground truth is the original image from Images folder
+        gt_img = image
+
+        scores = evaluator.compute(
+            name=name,
+            pred_img=result,
+            input_img=image,
+            mask_img=mask,
+            prompt=prompt,
+            gt_img=gt_img
+        )
+        logger.log(scores)
+        all_scores.append(scores)
+
+        compact = {k: v for k, v in scores.items() if k != "name" and v is not None}
+        print(f"  Metrics -> {compact}")
+
+    # End-of-run summary (mean across processed images) + append __MEAN__ row to same CSV
+    if all_scores:
+        metric_keys = [k for k in all_scores[0].keys() if k != "name"]
+        summary = {}
+        for k in metric_keys:
+            vals = [d[k] for d in all_scores if d.get(k) is not None]
+            summary[k] = float(np.mean(vals)) if vals else None
+
+        print("\n===== METRICS SUMMARY (mean over processed images) =====")
+        for k, v in summary.items():
+            if v is None:
+                continue
+            print(f"{k}: {v:.6f}")
+
+        summary_row = {"name": "__MEAN__"}
+        summary_row.update(summary)
+        logger.log(summary_row)
+        print("Summary row appended to CSV as name=__MEAN__")
 
     print(f"\nDone! All results saved to: {output_dir}/")
