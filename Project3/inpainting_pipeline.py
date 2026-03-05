@@ -8,6 +8,7 @@ Mask convention:
 
 import torch
 import numpy as np
+import cv2
 from PIL import Image
 from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -149,6 +150,25 @@ def postprocess(result_image: Image.Image, original_image: Image.Image, mask, re
     return Image.fromarray(output_np)
 
 
+def poisson_blend(result_np: np.ndarray, original_np: np.ndarray, mask_np: np.ndarray) -> np.ndarray:
+    mask_u8 = np.where(mask_np > 127, 255, 0).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return result_np
+
+    x, y, w, h = cv2.boundingRect(np.concatenate(contours))
+    cx = x + w // 2
+    cy = y + h // 2
+
+    try:
+        blended = cv2.seamlessClone(result_np, original_np, mask_u8, (cx, cy), cv2.NORMAL_CLONE)
+    except cv2.error:
+        return result_np
+
+    return blended
+
+
 def repaint_inpainting(
         image: Image.Image,
         mask,
@@ -162,7 +182,8 @@ def repaint_inpainting(
         guidance_scale: float     = 7.5,
         seed: int                 = 42,
         resolution: int           = 512,
-        device: str               = "cuda"
+        device: str               = "cuda",
+        use_poisson_blend: bool   = True
 ) -> Image.Image:
     """
     Args:
@@ -219,8 +240,18 @@ def repaint_inpainting(
 
     result_image = decode_latent_to_image(x_t, vae, device)
 
-    # Postprocess: restore original pixels in unmasked region to fix VAE drift
     result_image = postprocess(result_image, image, mask, resolution)
+
+    if use_poisson_blend:
+        orig_np   = np.array(image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
+        result_np = np.array(result_image)
+        if isinstance(mask, np.ndarray):
+            mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+        else:
+            mask_pil = mask.convert("L")
+        mask_np   = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
+        result_np = poisson_blend(result_np, orig_np, mask_np)
+        result_image = Image.fromarray(result_np)
 
     return result_image
 
@@ -275,6 +306,7 @@ if __name__ == "__main__":
     parser.add_argument("--guidance",    type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
     parser.add_argument("--seed",        type=int,   default=42,      help="Random seed (default: 42)")
     parser.add_argument("--device",      type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
+    parser.add_argument("--no-poisson",  action="store_true",         help="Disable Poisson blending")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -303,7 +335,8 @@ if __name__ == "__main__":
             num_inference_steps = args.steps,
             guidance_scale      = args.guidance,
             seed                = args.seed,
-            device              = args.device
+            device              = args.device,
+            use_poisson_blend   = not args.no_poisson
         )
 
         out_path = output_dir / f"{name}_result.png"
