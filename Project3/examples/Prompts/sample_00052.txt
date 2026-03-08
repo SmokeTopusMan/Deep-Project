@@ -1,1 +1,0 @@
-A sink that is in front of a mirror.
