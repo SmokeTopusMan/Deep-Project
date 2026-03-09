@@ -62,25 +62,7 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         # PIL: white(255) -> 1=inpaint, black(0) -> 0=keep
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
-
-    return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
-
-
-def preprocess_mask_pixel(mask, resolution: int = 512) -> torch.Tensor:
-    """
-    Same as preprocess_mask but at full pixel resolution (1, 1, H, W).
-    Used for postprocessing in pixel space.
-    """
-    if isinstance(mask, np.ndarray):
-        pil_mask = Image.fromarray((mask * 255).astype(np.uint8))
-        pil_mask = pil_mask.resize((resolution, resolution), Image.NEAREST)
-        arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
-    else:
-        pil_mask = mask.convert("L").resize((resolution, resolution), Image.NEAREST)
-        arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
