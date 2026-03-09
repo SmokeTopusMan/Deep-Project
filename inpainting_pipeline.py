@@ -6,8 +6,10 @@ Mask convention:
     Numpy arr : 1 = inpaint, 0 = keep
 """
 
+import math
 import torch
 import numpy as np
+import cv2
 from PIL import Image
 from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
@@ -20,7 +22,6 @@ def load_pipeline_components(
         device: str = "cuda"
 ):
     print(f"Loading model components from '{model_id}' ...")
-    # Use fp16 on CUDA for ~4x speedup with minimal quality loss
     dtype = torch.float16 if device == "cuda" else torch.float32
     tokenizer    = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
@@ -58,10 +59,9 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
     else:
-        # PIL: white(255) -> 1=inpaint, black(0) -> 0=keep
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
+        arr = (arr > 0.5).astype(np.float32)
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
@@ -79,14 +79,13 @@ def preprocess_mask_pixel(mask, resolution: int = 512) -> torch.Tensor:
     else:
         pil_mask = mask.convert("L").resize((resolution, resolution), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
+        arr = (arr > 0.5).astype(np.float32)
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
 
 def encode_image_to_latent(image_tensor: torch.Tensor, vae: AutoencoderKL, device: str) -> torch.Tensor:
     """Encodes pixel image to VAE latent space. Returns (1, 4, H//8, W//8)."""
-    # Cast to same dtype as VAE (fp16 on CUDA)
     image_tensor = image_tensor.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         latent = vae.encode(image_tensor).latent_dist.sample()
@@ -96,7 +95,7 @@ def encode_image_to_latent(image_tensor: torch.Tensor, vae: AutoencoderKL, devic
 
 def decode_latent_to_image(latent: torch.Tensor, vae: AutoencoderKL, device: str) -> Image.Image:
     """Decodes VAE latent back to a PIL image."""
-    latent = latent.to(device=device, dtype=vae.dtype)  # ensure fp16
+    latent = latent.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         image_tensor = vae.decode(latent / vae.config.scaling_factor).sample
     image_tensor = image_tensor.squeeze(0).permute(1, 2, 0)
@@ -128,25 +127,139 @@ def postprocess(result_image: Image.Image, original_image: Image.Image, mask, re
     result pixel with the exact original pixel, regardless of result value.
     White mask pixels (inpaint region) are left untouched.
     """
-    # Resize both images to pipeline resolution
     orig_np   = np.array(original_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
     result_np = np.array(result_image)
 
-    # Build binary bitmap from mask
     if isinstance(mask, np.ndarray):
         mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
     else:
         mask_pil = mask.convert("RGB")
     mask_np = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
 
-    # CHANGED: A pixel is "white" (inpaint) if all channels are above threshold 250
-    is_white = np.all(mask_np > 250, axis=2)  # (H, W) bool, True=inpaint
+    is_white = np.all(mask_np > 250, axis=2)
 
-    # Hard swap: wherever is_white is False (keep region), use original pixel exactly
     output_np = result_np.copy()
     output_np[~is_white] = orig_np[~is_white]
 
     return Image.fromarray(output_np)
+
+
+def poisson_blend(result_np: np.ndarray, original_np: np.ndarray, mask_np: np.ndarray) -> np.ndarray:
+    mask_u8 = np.where(mask_np > 127, 255, 0).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return result_np
+
+    x, y, w, h = cv2.boundingRect(np.concatenate(contours))
+    cx = x + w // 2
+    cy = y + h // 2
+
+    try:
+        blended = cv2.seamlessClone(result_np, original_np, mask_u8, (cx, cy), cv2.NORMAL_CLONE)
+    except cv2.error:
+        return result_np
+
+    return blended
+
+
+def build_resample_schedule(
+        num_steps: int,
+        jump_max: int,
+        jump_min: int,
+        rep_max: int
+) -> list:
+    """
+    Builds a list of segments (start, jump, rep) that together cover all num_steps.
+
+    Each segment starts at index `start`, walks forward `jump` steps, and repeats `rep` times.
+    Segments are built greedily: start=0, then start+=jump, until we cover num_steps.
+
+    Cosine schedule per segment:
+        progress = 0 (start, high noise):  rep -> rep_max,  jump -> jump_min
+        progress = 1 (end,   low  noise):  rep -> 1,         jump -> jump_max
+    """
+    segments = []
+    i = 0
+    while i < num_steps:
+        progress = i / max(num_steps - 1, 1)
+        jump = max(1, round(jump_min + (jump_max - jump_min) * 0.5 * (1.0 - math.cos(math.pi * progress))))
+        jump = min(jump, num_steps - i)
+        rep  = max(1, round(rep_max * 0.5 * (1.0 + math.cos(math.pi * progress))))
+        segments.append((i, jump, rep))
+        i += jump
+    return segments
+
+
+def denoise_blend_step(
+        x_t: torch.Tensor,
+        step_idx: int,
+        timesteps_list: list,
+        original_latent: torch.Tensor,
+        mask_latent: torch.Tensor,
+        text_embeddings: torch.Tensor,
+        unet,
+        scheduler,
+        guidance_scale: float,
+        device: str
+) -> torch.Tensor:
+    """
+    Runs one full denoising + RePaint blend step.
+    Takes x_t at noise level timesteps_list[step_idx],
+    returns x_t at noise level timesteps_list[step_idx + 1] (or 0 at the last step).
+    """
+    t = timesteps_list[step_idx]
+
+    unet_input = scheduler.scale_model_input(torch.cat([x_t, x_t], dim=0), t)
+    unet_input = unet_input.to(dtype=unet.dtype)
+    with torch.no_grad():
+        noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeddings).sample
+
+    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+    x_t_minus_1 = scheduler.step(noise_pred, t, x_t).prev_sample
+
+    t_prev         = timesteps_list[step_idx + 1].item() if step_idx + 1 < len(timesteps_list) else 0
+    alpha_bar_prev = scheduler.alphas_cumprod[t_prev]
+    noise          = torch.randn_like(original_latent, dtype=unet.dtype)
+
+    if t_prev > 0:
+        original_at_t_minus_1 = (alpha_bar_prev ** 0.5) * original_latent + ((1 - alpha_bar_prev) ** 0.5) * noise
+    else:
+        original_at_t_minus_1 = original_latent
+
+    return (mask_latent * x_t_minus_1) + ((1 - mask_latent) * original_at_t_minus_1)
+
+
+def renoise(
+        x_t: torch.Tensor,
+        from_idx: int,
+        to_idx: int,
+        timesteps_list: list,
+        scheduler,
+        device: str
+) -> torch.Tensor:
+    """
+    Adds noise to x_t to jump from a cleaner noise level back to a noisier one.
+
+    from_idx > to_idx  (to_idx is earlier in the schedule = higher noise level)
+
+    Uses the DDPM conditional forward process:
+        x_{t_to} = sqrt(alpha_to / alpha_from) * x_{t_from}
+                 + sqrt(1 - alpha_to / alpha_from) * eps
+    """
+    t_from = timesteps_list[from_idx].item() if from_idx < len(timesteps_list) else 0
+    t_to   = timesteps_list[to_idx].item()
+
+    alpha_from = scheduler.alphas_cumprod[t_from].to(device) if t_from > 0 else torch.ones(1, device=device)
+    alpha_to   = scheduler.alphas_cumprod[t_to].to(device)
+
+    ratio       = (alpha_to / alpha_from).sqrt()
+    noise_scale = (1.0 - alpha_to / alpha_from).clamp(min=0.0).sqrt()
+
+    noise = torch.randn_like(x_t)
+    return (ratio * x_t + noise_scale * noise).to(dtype=x_t.dtype)
 
 
 def repaint_inpainting(
@@ -162,7 +275,11 @@ def repaint_inpainting(
         guidance_scale: float     = 7.5,
         seed: int                 = 42,
         resolution: int           = 512,
-        device: str               = "cuda"
+        device: str               = "cuda",
+        jump_max: int             = 10,
+        jump_min: int             = 2,
+        rep_max: int              = 5,
+        use_poisson_blend: bool   = True
 ) -> Image.Image:
     """
     Args:
@@ -173,6 +290,10 @@ def repaint_inpainting(
         num_inference_steps : Reverse diffusion steps (more = better quality, slower)
         guidance_scale      : CFG strength — higher follows prompt more strictly
         seed                : Random seed for reproducibility
+        jump_max            : Max jump size (used at end of schedule, low noise)
+        jump_min            : Min jump size (used at start of schedule, high noise)
+        rep_max             : Max repetitions per step (used at start of schedule)
+        use_poisson_blend   : Whether to apply Poisson blending as a final postprocessing step
     Returns:
         Inpainted PIL Image with postprocessing applied
     """
@@ -184,43 +305,48 @@ def repaint_inpainting(
     original_latent = encode_image_to_latent(image_tensor, vae, device)
     text_embeddings = encode_text_prompt(prompt, tokenizer, text_encoder, device)
 
-    # Start from pure Gaussian noise (x_T), cast to model dtype (fp16 on CUDA)
     x_t = torch.randn(original_latent.shape, generator=generator, device=device, dtype=unet.dtype)
     x_t = x_t * scheduler.init_noise_sigma
 
-    for t in tqdm(scheduler.timesteps, desc="Inpainting"):
+    segments       = build_resample_schedule(num_inference_steps, jump_max, jump_min, rep_max)
+    timesteps_list = list(scheduler.timesteps)
 
-        # CFG: run UNet with both conditional and unconditional embeddings in one pass
-        unet_input = scheduler.scale_model_input(torch.cat([x_t, x_t], dim=0), t)
-        unet_input = unet_input.to(dtype=unet.dtype)  # ensure fp16
-        with torch.no_grad():
-            noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeddings).sample
+    total_denoise_ops = sum(jump * rep for _, jump, rep in segments)
+    print(f"  Resampling schedule: {len(segments)} segments, ~{total_denoise_ops} total denoising ops (base: {num_inference_steps})")
 
-        # Combine conditional and unconditional predictions
-        noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+    pbar = tqdm(total=num_inference_steps, desc="Inpainting")
 
-        # Scheduler step: remove predicted noise to get x_{t-1}
-        x_t_minus_1 = scheduler.step(noise_pred, t, x_t).prev_sample
+    for start, jump, rep in segments:
+        end = start + jump
 
-        # Re-noise original to level t-1: x_{t-1} = sqrt(a)*x0 + sqrt(1-a)*eps
-        current_idx = (scheduler.timesteps == t).nonzero().item()
-        t_prev = scheduler.timesteps[current_idx + 1].item() if current_idx + 1 < len(scheduler.timesteps) else 0
-        alpha_bar_prev = scheduler.alphas_cumprod[t_prev]
-        noise = torch.randn_like(original_latent, dtype=unet.dtype)
+        for r in range(rep):
+            for j in range(start, end):
+                x_t = denoise_blend_step(
+                    x_t, j, timesteps_list,
+                    original_latent, mask_latent, text_embeddings,
+                    unet, scheduler, guidance_scale, device
+                )
 
-        if t_prev > 0:
-            original_at_t_minus_1 = (alpha_bar_prev ** 0.5) * original_latent + ((1 - alpha_bar_prev) ** 0.5) * noise
-        else:
-            original_at_t_minus_1 = original_latent
+            if r < rep - 1:
+                x_t = renoise(x_t, end, start, timesteps_list, scheduler, device)
 
-        # RePaint blend: masked region from UNet, unmasked from re-noised original
-        x_t = (mask_latent * x_t_minus_1) + ((1 - mask_latent) * original_at_t_minus_1)
+        pbar.update(jump)
+
+    pbar.close()
 
     result_image = decode_latent_to_image(x_t, vae, device)
-
-    # Postprocess: restore original pixels in unmasked region to fix VAE drift
     result_image = postprocess(result_image, image, mask, resolution)
+
+    if use_poisson_blend:
+        orig_np   = np.array(image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
+        result_np = np.array(result_image)
+        if isinstance(mask, np.ndarray):
+            mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+        else:
+            mask_pil = mask.convert("L")
+        mask_np      = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
+        result_np    = poisson_blend(result_np, orig_np, mask_np)
+        result_image = Image.fromarray(result_np)
 
     return result_image
 
@@ -267,14 +393,18 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — batch directory mode")
-    parser.add_argument("--images",  type=str, required=True,     help="Directory of input images (.jpg/.png)")
-    parser.add_argument("--masks",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
-    parser.add_argument("--prompts", type=str, required=True,     help="Directory of prompt .txt files")
-    parser.add_argument("--output",  type=str, default="results", help="Directory to save results")
-    parser.add_argument("--steps",       type=int,   default=50,      help="Diffusion steps (default: 50)")
-    parser.add_argument("--guidance",    type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
-    parser.add_argument("--seed",        type=int,   default=42,      help="Random seed (default: 42)")
-    parser.add_argument("--device",      type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
+    parser.add_argument("--images",    type=str, required=True,     help="Directory of input images (.jpg/.png)")
+    parser.add_argument("--masks",     type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
+    parser.add_argument("--prompts",   type=str, required=True,     help="Directory of prompt .txt files")
+    parser.add_argument("--output",    type=str, default="results", help="Directory to save results")
+    parser.add_argument("--steps",     type=int,   default=50,      help="Diffusion steps (default: 50)")
+    parser.add_argument("--guidance",  type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
+    parser.add_argument("--seed",      type=int,   default=42,      help="Random seed (default: 42)")
+    parser.add_argument("--device",    type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
+    parser.add_argument("--jump-max",  type=int,   default=10,      help="Max jump size at end of schedule (default: 10)")
+    parser.add_argument("--jump-min",  type=int,   default=2,       help="Min jump size at start of schedule (default: 2)")
+    parser.add_argument("--rep-max",   type=int,   default=5,       help="Max repetitions at start of schedule (default: 5)")
+    parser.add_argument("--no-poisson", action="store_true",        help="Disable Poisson blending")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -303,7 +433,11 @@ if __name__ == "__main__":
             num_inference_steps = args.steps,
             guidance_scale      = args.guidance,
             seed                = args.seed,
-            device              = args.device
+            device              = args.device,
+            jump_max            = args.jump_max,
+            jump_min            = args.jump_min,
+            rep_max             = args.rep_max,
+            use_poisson_blend   = not args.no_poisson
         )
 
         out_path = output_dir / f"{name}_result.png"
