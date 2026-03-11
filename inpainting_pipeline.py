@@ -445,6 +445,7 @@ if __name__ == "__main__":
         print(f"\n[{i+1}/{len(triplets)}] Processing '{name}' ...")
         print(f"  Prompt: \"{prompt}\"")
 
+        per_image_seed = args.seed + i
         result = repaint_inpainting(
             image               = image,
             mask                = mask,
@@ -456,13 +457,14 @@ if __name__ == "__main__":
             scheduler           = scheduler,
             num_inference_steps = args.steps,
             guidance_scale      = args.guidance,
-            seed                = args.seed,
+            seed                = per_image_seed,
             device              = args.device,
             jump_max            = args.jump_max,
             jump_min            = args.jump_min,
             rep_max             = args.rep_max,
             free_denoise_after  = args.free_denoise_after
         )
+        print(f"  Seed: {per_image_seed}")
 
         out_path = output_dir / f"{name}_result.png"
         result.save(out_path)
