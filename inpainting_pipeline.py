@@ -194,6 +194,59 @@ def denoise_blend_step(
     return (mask_latent * x_t_minus_1) + ((1 - mask_latent) * original_at_t_minus_1)
 
 
+def denoise_step_free(
+        x_t: torch.Tensor,
+        step_idx: int,
+        timesteps_list: list,
+        text_embeddings: torch.Tensor,
+        unet,
+        scheduler,
+        guidance_scale: float,
+) -> torch.Tensor:
+    """
+    Denoising step with NO blend — both keep and inpaint regions evolve freely together.
+    Used during resample sub-steps so the two regions can reconcile through joint denoising.
+    The keep region is snapped back to the original only once, at the end of the repetition.
+    """
+    t = timesteps_list[step_idx]
+
+    unet_input = scheduler.scale_model_input(torch.cat([x_t, x_t], dim=0), t)
+    unet_input = unet_input.to(dtype=unet.dtype)
+    with torch.no_grad():
+        noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeddings).sample
+
+    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+    return scheduler.step(noise_pred, t, x_t).prev_sample
+
+
+def snap_keep_region(
+        x_t: torch.Tensor,
+        original_latent: torch.Tensor,
+        mask_latent: torch.Tensor,
+        step_idx: int,
+        timesteps_list: list,
+        unet,
+        scheduler,
+        device: str
+) -> torch.Tensor:
+    """
+    Snaps the keep region back to the noised original at the current noise level.
+    Called once at the end of each resample repetition.
+    """
+    t_curr = timesteps_list[step_idx].item() if step_idx < len(timesteps_list) else 0
+    alpha_bar = scheduler.alphas_cumprod[t_curr]
+    noise = torch.randn_like(original_latent, dtype=unet.dtype)
+
+    if t_curr > 0:
+        original_at_t = (alpha_bar ** 0.5) * original_latent + ((1 - alpha_bar) ** 0.5) * noise
+    else:
+        original_at_t = original_latent
+
+    return (mask_latent * x_t) + ((1 - mask_latent) * original_at_t)
+
+
 def renoise(
         x_t: torch.Tensor,
         from_idx: int,
@@ -233,14 +286,15 @@ def repaint_inpainting(
         vae,
         unet,
         scheduler,
-        num_inference_steps: int  = 50,
-        guidance_scale: float     = 7.5,
-        seed: int                 = 42,
-        resolution: int           = 512,
-        device: str               = "cuda",
-        jump_max: int             = 10,
-        jump_min: int             = 2,
-        rep_max: int              = 5
+        num_inference_steps: int   = 50,
+        guidance_scale: float      = 7.5,
+        seed: int                  = 42,
+        resolution: int            = 512,
+        device: str                = "cuda",
+        jump_max: int              = 10,
+        jump_min: int              = 2,
+        rep_max: int               = 5,
+        free_denoise_after: float  = 0.4
 ) -> Image.Image:
     """
     Args:
@@ -254,6 +308,12 @@ def repaint_inpainting(
         jump_max            : Max jump size (used at end of schedule, low noise)
         jump_min            : Min jump size (used at start of schedule, high noise)
         rep_max             : Max repetitions per step (used at start of schedule)
+        free_denoise_after  : Fraction of steps after which free joint denoising is used
+                              during resample sub-steps. Before this threshold the keep
+                              region is anchored at every step (inpaint region is still
+                              mostly noise and needs the context). After this threshold
+                              both regions evolve freely and the keep region is only
+                              snapped back once at the end of each repetition.
     Returns:
         Inpainted PIL Image with postprocessing applied
     """
@@ -278,13 +338,28 @@ def repaint_inpainting(
 
     for start, jump, rep in segments:
         end = start + jump
+        progress = start / max(num_inference_steps - 1, 1)
+        is_early = progress < free_denoise_after
 
         for r in range(rep):
             for j in range(start, end):
-                x_t = denoise_blend_step(
-                    x_t, j, timesteps_list,
-                    original_latent, mask_latent, text_embeddings,
-                    unet, scheduler, guidance_scale, device
+                if is_early:
+                    x_t = denoise_blend_step(
+                        x_t, j, timesteps_list,
+                        original_latent, mask_latent, text_embeddings,
+                        unet, scheduler, guidance_scale, device
+                    )
+                else:
+                    x_t = denoise_step_free(
+                        x_t, j, timesteps_list,
+                        text_embeddings, unet, scheduler, guidance_scale
+                    )
+
+            if not is_early:
+                x_t = snap_keep_region(
+                    x_t, original_latent, mask_latent,
+                    end if end < len(timesteps_list) else len(timesteps_list) - 1,
+                    timesteps_list, unet, scheduler, device
                 )
 
             if r < rep - 1:
@@ -350,12 +425,10 @@ if __name__ == "__main__":
     parser.add_argument("--guidance", type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
     parser.add_argument("--seed",     type=int,   default=42,      help="Random seed (default: 42)")
     parser.add_argument("--device",   type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
-    parser.add_argument("--jump-max", type=int,   default=10,      help="Max "
-                                                                        "jump size at end of schedule (default: 10)")
-    parser.add_argument("--jump-min", type=int,   default=3,       help="Min "
-                                                                        "jump size at start of schedule (default: 2)")
-    parser.add_argument("--rep-max",  type=int,   default=2,       help="Max "
-                                                                        "repetitions at start of schedule (default: 5)")
+    parser.add_argument("--jump-max",           type=int,   default=10,  help="Max jump size at end of schedule (default: 10)")
+    parser.add_argument("--jump-min",           type=int,   default=3,   help="Min jump size at start of schedule (default: 3)")
+    parser.add_argument("--rep-max",            type=int,   default=5,   help="Max repetitions at start of schedule (default: 5)")
+    parser.add_argument("--free-denoise-after", type=float, default=0.4, help="Fraction of steps after which free joint denoising is used (default: 0.4)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -387,7 +460,8 @@ if __name__ == "__main__":
             device              = args.device,
             jump_max            = args.jump_max,
             jump_min            = args.jump_min,
-            rep_max             = args.rep_max
+            rep_max             = args.rep_max,
+            free_denoise_after  = args.free_denoise_after
         )
 
         out_path = output_dir / f"{name}_result.png"
