@@ -7,12 +7,147 @@ Mask convention:
 """
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from diffusers import DDPMScheduler, AutoencoderKL, UNet2DConditionModel
 from transformers import CLIPTextModel, CLIPTokenizer
 from tqdm import tqdm
 from pathlib import Path
+
+
+class AttentionStore:
+    """
+    Stores self-attention keys and values from a reference UNet forward pass,
+    then injects them into the masked region during the inpainting forward pass.
+
+    Only self-attention layers are targeted (cross-attention uses text embeddings
+    as K/V so injection there would corrupt the prompt conditioning).
+
+    Usage:
+        store = AttentionStore(unet)
+        store.enable_reference_mode()   # next forward pass stores K/V
+        unet(reference_latent, ...)
+        store.enable_injection_mode(mask_latent)  # next forward pass injects
+        unet(x_t, ...)
+        store.disable()
+    """
+
+    def __init__(self, unet: UNet2DConditionModel):
+        self.unet   = unet
+        self._hooks = []
+        self._store: dict[str, dict] = {}
+        self._mode  = "off"
+        self._mask_latent: torch.Tensor = None
+
+    def _is_self_attn(self, module) -> bool:
+        return (
+                hasattr(module, "to_q") and
+                hasattr(module, "to_k") and
+                hasattr(module, "to_v") and
+                not hasattr(module, "add_k_proj")
+        )
+
+    def _make_hook(self, name: str):
+        def hook(module, args, kwargs, output):
+            if self._mode == "off":
+                return output
+
+            hidden = args[0] if args else kwargs.get("hidden_states")
+            if hidden is None:
+                return output
+
+            B, seq, dim = hidden.shape
+
+            q = module.to_q(hidden)
+            k = module.to_k(hidden)
+            v = module.to_v(hidden)
+
+            heads     = module.heads
+            head_dim  = dim // heads
+
+            def split_heads(x):
+                return x.reshape(B, seq, heads, head_dim).permute(0, 2, 1, 3)
+
+            if self._mode == "store":
+                self._store[name] = {
+                    "k": split_heads(k).detach(),
+                    "v": split_heads(v).detach(),
+                }
+                return output
+
+            if self._mode == "inject" and name in self._store:
+                ref_k = self._store[name]["k"]
+                ref_v = self._store[name]["v"]
+
+                if ref_k.shape[0] != B:
+                    ref_k = ref_k.expand(B, -1, -1, -1)
+                    ref_v = ref_v.expand(B, -1, -1, -1)
+
+                q_heads = split_heads(q)
+                k_heads = split_heads(k)
+                v_heads = split_heads(v)
+
+                mask_down = self._get_spatial_mask(seq, hidden.device, hidden.dtype)
+                mask_flat = mask_down.reshape(1, 1, seq, 1)
+
+                k_blended = k_heads * (1 - mask_flat) + ref_k * mask_flat
+                v_blended = v_heads * (1 - mask_flat) + ref_v * mask_flat
+
+                k_combined = torch.cat([k_heads, k_blended], dim=2)
+                v_combined = torch.cat([v_heads, v_blended], dim=2)
+
+                scale  = head_dim ** -0.5
+                scores = torch.einsum("bhqd,bhkd->bhqk", q_heads * scale, k_combined)
+                attn   = scores.softmax(dim=-1)
+                out    = torch.einsum("bhqk,bhkd->bhqd", attn, v_combined)
+
+                out = out.permute(0, 2, 1, 3).reshape(B, seq, dim)
+                out = module.to_out[0](out)
+                out = module.to_out[1](out)
+                return out
+
+            return output
+
+        return hook
+
+    def _get_spatial_mask(self, seq_len: int, device, dtype) -> torch.Tensor:
+        if self._mask_latent is None:
+            return torch.ones(seq_len, device=device, dtype=dtype)
+        H = W = int(seq_len ** 0.5)
+        m = F.interpolate(
+            self._mask_latent.float(),
+            size=(H, W),
+            mode="nearest"
+        ).squeeze().reshape(-1).to(device=device, dtype=dtype)
+        return m
+
+    def enable_reference_mode(self):
+        self._store.clear()
+        self._mode = "store"
+        self._register_hooks()
+
+    def enable_injection_mode(self, mask_latent: torch.Tensor):
+        self._mask_latent = mask_latent
+        self._mode = "inject"
+        self._register_hooks()
+
+    def disable(self):
+        self._mode = "off"
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+
+    def _register_hooks(self):
+        for h in self._hooks:
+            h.remove()
+        self._hooks.clear()
+        for name, module in self.unet.named_modules():
+            if self._is_self_attn(module):
+                h = module.register_forward_hook(
+                    self._make_hook(name), with_kwargs=True
+                )
+                self._hooks.append(h)
 
 
 def load_pipeline_components(
@@ -162,7 +297,9 @@ def repaint_inpainting(
         guidance_scale: float     = 7.5,
         seed: int                 = 42,
         resolution: int           = 512,
-        device: str               = "cuda"
+        device: str               = "cuda",
+        inject_attention: bool    = True,
+        injection_end: float      = 0.7
 ) -> Image.Image:
     """
     Args:
@@ -173,6 +310,10 @@ def repaint_inpainting(
         num_inference_steps : Reverse diffusion steps (more = better quality, slower)
         guidance_scale      : CFG strength — higher follows prompt more strictly
         seed                : Random seed for reproducibility
+        inject_attention    : Whether to use self-attention feature injection
+        injection_end       : Fraction of timesteps after which injection stops.
+                              Early/mid steps benefit most; late steps can be left free
+                              so fine details aren't over-constrained by the reference.
     Returns:
         Inpainted PIL Image with postprocessing applied
     """
@@ -184,26 +325,47 @@ def repaint_inpainting(
     original_latent = encode_image_to_latent(image_tensor, vae, device)
     text_embeddings = encode_text_prompt(prompt, tokenizer, text_encoder, device)
 
-    # Start from pure Gaussian noise (x_T), cast to model dtype (fp16 on CUDA)
     x_t = torch.randn(original_latent.shape, generator=generator, device=device, dtype=unet.dtype)
     x_t = x_t * scheduler.init_noise_sigma
 
-    for t in tqdm(scheduler.timesteps, desc="Inpainting"):
+    attn_store = AttentionStore(unet) if inject_attention else None
+    total_steps = len(scheduler.timesteps)
 
-        # CFG: run UNet with both conditional and unconditional embeddings in one pass
+    for step_idx, t in enumerate(tqdm(scheduler.timesteps, desc="Inpainting")):
+
+        progress = step_idx / total_steps
+        should_inject = inject_attention and progress < injection_end
+
+        if should_inject:
+            t_int = t.item() if hasattr(t, "item") else int(t)
+            alpha_bar = scheduler.alphas_cumprod[t_int]
+            noise = torch.randn_like(original_latent, dtype=unet.dtype)
+            original_at_t = (alpha_bar ** 0.5) * original_latent + ((1 - alpha_bar) ** 0.5) * noise
+
+            attn_store.enable_reference_mode()
+            with torch.no_grad():
+                unet(
+                    scheduler.scale_model_input(original_at_t, t).to(dtype=unet.dtype),
+                    t,
+                    encoder_hidden_states=text_embeddings[0:1]
+                )
+            attn_store.disable()
+
+            attn_store.enable_injection_mode(mask_latent)
+
         unet_input = scheduler.scale_model_input(torch.cat([x_t, x_t], dim=0), t)
-        unet_input = unet_input.to(dtype=unet.dtype)  # ensure fp16
+        unet_input = unet_input.to(dtype=unet.dtype)
         with torch.no_grad():
             noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeddings).sample
 
-        # Combine conditional and unconditional predictions
+        if should_inject:
+            attn_store.disable()
+
         noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        # Scheduler step: remove predicted noise to get x_{t-1}
         x_t_minus_1 = scheduler.step(noise_pred, t, x_t).prev_sample
 
-        # Re-noise original to level t-1: x_{t-1} = sqrt(a)*x0 + sqrt(1-a)*eps
         current_idx = (scheduler.timesteps == t).nonzero().item()
         t_prev = scheduler.timesteps[current_idx + 1].item() if current_idx + 1 < len(scheduler.timesteps) else 0
         alpha_bar_prev = scheduler.alphas_cumprod[t_prev]
@@ -214,12 +376,9 @@ def repaint_inpainting(
         else:
             original_at_t_minus_1 = original_latent
 
-        # RePaint blend: masked region from UNet, unmasked from re-noised original
         x_t = (mask_latent * x_t_minus_1) + ((1 - mask_latent) * original_at_t_minus_1)
 
     result_image = decode_latent_to_image(x_t, vae, device)
-
-    # Postprocess: restore original pixels in unmasked region to fix VAE drift
     result_image = postprocess(result_image, image, mask, resolution)
 
     return result_image
@@ -271,10 +430,12 @@ if __name__ == "__main__":
     parser.add_argument("--masks",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
     parser.add_argument("--prompts", type=str, required=True,     help="Directory of prompt .txt files")
     parser.add_argument("--output",  type=str, default="results", help="Directory to save results")
-    parser.add_argument("--steps",       type=int,   default=50,      help="Diffusion steps (default: 50)")
-    parser.add_argument("--guidance",    type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
-    parser.add_argument("--seed",        type=int,   default=42,      help="Random seed (default: 42)")
-    parser.add_argument("--device",      type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
+    parser.add_argument("--steps",            type=int,   default=50,   help="Diffusion steps (default: 50)")
+    parser.add_argument("--guidance",          type=float, default=7.5,  help="CFG guidance scale (default: 7.5)")
+    parser.add_argument("--seed",              type=int,   default=42,   help="Base random seed (default: 42)")
+    parser.add_argument("--device",            type=str,   default="cuda", help="cuda or cpu (default: cuda)")
+    parser.add_argument("--no-inject",         action="store_true",      help="Disable self-attention injection")
+    parser.add_argument("--injection-end",     type=float, default=0.7,  help="Fraction of steps to inject attention for (default: 0.7)")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
@@ -291,6 +452,7 @@ if __name__ == "__main__":
         print(f"\n[{i+1}/{len(triplets)}] Processing '{name}' ...")
         print(f"  Prompt: \"{prompt}\"")
 
+        per_image_seed = args.seed + i
         result = repaint_inpainting(
             image               = image,
             mask                = mask,
@@ -302,9 +464,12 @@ if __name__ == "__main__":
             scheduler           = scheduler,
             num_inference_steps = args.steps,
             guidance_scale      = args.guidance,
-            seed                = args.seed,
-            device              = args.device
+            seed                = per_image_seed,
+            device              = args.device,
+            inject_attention    = not args.no_inject,
+            injection_end       = args.injection_end
         )
+        print(f"  Seed: {per_image_seed}")
 
         out_path = output_dir / f"{name}_result.png"
         result.save(out_path)
