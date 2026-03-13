@@ -6,6 +6,7 @@ Mask convention:
     Numpy arr : 1 = inpaint, 0 = keep
 """
 
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -17,27 +18,11 @@ from pathlib import Path
 
 
 class AttentionStore:
-    """
-    Stores self-attention K/V from a reference image and injects them into
-    the masked region during the inpainting forward pass.
-
-    Optimizations vs naive implementation:
-    - Hooks registered once at construction, never torn down between steps.
-      Mode is toggled via a flag instead of re-registering every step.
-    - Reference is batched into the CFG forward pass as a third element
-      [cond, uncond, reference], so no separate UNet forward pass is needed.
-      The hook captures K/V from index 2 and injects into indices 0 and 1
-      within the same call — no cross-step store needed.
-    - heads and head_dim captured once per hook at registration, not recomputed
-      on every forward call.
-    - Spatial mask downsampled once per unique seq_len and cached across steps.
-      Cache only cleared when the mask tensor actually changes between images.
-    - Attention computed with F.scaled_dot_product_attention (Flash Attention on CUDA).
-    """
 
     def __init__(self, unet: UNet2DConditionModel):
         self.unet          = unet
         self._mode         = False
+        self._strength     = 1.0
         self._mask_latent: torch.Tensor = None
         self._mask_cache: dict[int, torch.Tensor] = {}
         self._hooks        = []
@@ -73,7 +58,7 @@ class AttentionStore:
             ref_v = v[2:3]
 
             mask_flat = self._get_spatial_mask(seq, hidden.device, hidden.dtype)
-            mask_flat = mask_flat.reshape(1, 1, seq, 1)
+            w = self._strength * mask_flat.reshape(1, 1, seq, 1)
 
             q_inpaint = q[:2]
             k_inpaint = k[:2]
@@ -82,8 +67,8 @@ class AttentionStore:
             ref_k_exp = ref_k.expand(2, -1, -1, -1)
             ref_v_exp = ref_v.expand(2, -1, -1, -1)
 
-            k_blended = k_inpaint * (1 - mask_flat) + ref_k_exp * mask_flat
-            v_blended = v_inpaint * (1 - mask_flat) + ref_v_exp * mask_flat
+            k_blended = k_inpaint * (1 - w) + ref_k_exp * w
+            v_blended = v_inpaint * (1 - w) + ref_v_exp * w
 
             k_combined = torch.cat([k_inpaint, k_blended], dim=2)
             v_combined = torch.cat([v_inpaint, v_blended], dim=2)
@@ -112,11 +97,12 @@ class AttentionStore:
         self._mask_cache[seq_len] = m
         return m
 
-    def enable(self, mask_latent: torch.Tensor):
+    def enable(self, mask_latent: torch.Tensor, strength: float = 1.0):
         if mask_latent is not self._mask_latent:
             self._mask_latent = mask_latent
             self._mask_cache.clear()
-        self._mode = True
+        self._strength = strength
+        self._mode     = True
 
     def disable(self):
         self._mode = False
@@ -132,12 +118,31 @@ class AttentionStore:
                 self._hooks.append(h)
 
 
+def compute_injection_strength(
+        step_idx: int,
+        total_steps: int,
+        injection_end: float,
+        schedule: str,
+        exp_decay: float = 5.0
+) -> float:
+    progress = step_idx / max(total_steps - 1, 1)
+    if progress >= injection_end:
+        return 0.0
+    p = progress / injection_end
+    if schedule == "linear":
+        return 1.0 - p
+    if schedule == "cosine":
+        return 0.5 * (1.0 + math.cos(math.pi * p))
+    if schedule == "exp":
+        return math.exp(-exp_decay * p)
+    return 1.0
+
+
 def load_pipeline_components(
         model_id: str = "sd2-community/stable-diffusion-2-base",
         device: str = "cuda"
 ):
     print(f"Loading model components from '{model_id}' ...")
-    # Use fp16 on CUDA for ~4x speedup with minimal quality loss
     dtype = torch.float16 if device == "cuda" else torch.float32
     tokenizer    = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
@@ -155,7 +160,6 @@ def load_pipeline_components(
 
 
 def preprocess_image(image: Image.Image, resolution: int = 512) -> torch.Tensor:
-    """Returns (1, 3, H, W) tensor in [-1, 1]."""
     image = image.convert("RGB").resize((resolution, resolution), Image.LANCZOS)
     arr   = np.array(image).astype(np.float32) / 255.0
     arr   = arr * 2.0 - 1.0
@@ -163,10 +167,6 @@ def preprocess_image(image: Image.Image, resolution: int = 512) -> torch.Tensor:
 
 
 def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
-    """
-    Returns (1, 1, H//8, W//8) binary tensor: 1=inpaint, 0=keep.
-    Downscaled to latent resolution (VAE compresses by 8x).
-    """
     latent_res = resolution // 8
 
     if isinstance(mask, np.ndarray):
@@ -175,17 +175,14 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
     else:
-        # PIL: white(255) -> 1=inpaint, black(0) -> 0=keep
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
-        arr = (arr > 0.5).astype(np.float32) # CHANGED: < 0.5 to > 0.5
+        arr = (arr > 0.5).astype(np.float32)
 
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
 
 def encode_image_to_latent(image_tensor: torch.Tensor, vae: AutoencoderKL, device: str) -> torch.Tensor:
-    """Encodes pixel image to VAE latent space. Returns (1, 4, H//8, W//8)."""
-    # Cast to same dtype as VAE (fp16 on CUDA)
     image_tensor = image_tensor.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         latent = vae.encode(image_tensor).latent_dist.sample()
@@ -194,8 +191,7 @@ def encode_image_to_latent(image_tensor: torch.Tensor, vae: AutoencoderKL, devic
 
 
 def decode_latent_to_image(latent: torch.Tensor, vae: AutoencoderKL, device: str) -> Image.Image:
-    """Decodes VAE latent back to a PIL image."""
-    latent = latent.to(device=device, dtype=vae.dtype)  # ensure fp16
+    latent = latent.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         image_tensor = vae.decode(latent / vae.config.scaling_factor).sample
     image_tensor = image_tensor.squeeze(0).permute(1, 2, 0)
@@ -204,11 +200,6 @@ def decode_latent_to_image(latent: torch.Tensor, vae: AutoencoderKL, device: str
 
 
 def encode_text_prompt(prompt: str, tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, device: str) -> torch.Tensor:
-    """
-    Returns stacked CLIP embeddings (2, 77, 1024):
-        [0] = conditional (real prompt), [1] = unconditional (empty string)
-    Both are needed for Classifier-Free Guidance (CFG).
-    """
     tokens = tokenizer(
         [prompt, ""],
         padding="max_length",
@@ -222,26 +213,17 @@ def encode_text_prompt(prompt: str, tokenizer: CLIPTokenizer, text_encoder: CLIP
 
 
 def postprocess(result_image: Image.Image, original_image: Image.Image, mask, resolution: int = 512) -> Image.Image:
-    """
-    Hard pixel swap: for every pixel where mask is NOT white, replace the
-    result pixel with the exact original pixel, regardless of result value.
-    White mask pixels (inpaint region) are left untouched.
-    """
-    # Resize both images to pipeline resolution
     orig_np   = np.array(original_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
     result_np = np.array(result_image)
 
-    # Build binary bitmap from mask
     if isinstance(mask, np.ndarray):
         mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
     else:
         mask_pil = mask.convert("RGB")
     mask_np = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
 
-    # CHANGED: A pixel is "white" (inpaint) if all channels are above threshold 250
-    is_white = np.all(mask_np > 250, axis=2)  # (H, W) bool, True=inpaint
+    is_white = np.all(mask_np > 250, axis=2)
 
-    # Hard swap: wherever is_white is False (keep region), use original pixel exactly
     output_np = result_np.copy()
     output_np[~is_white] = orig_np[~is_white]
 
@@ -263,23 +245,21 @@ def repaint_inpainting(
         resolution: int           = 512,
         device: str               = "cuda",
         inject_attention: bool    = True,
-        injection_end: float      = 0.7
+        injection_end: float      = 0.7,
+        injection_schedule: str   = "cosine",
+        exp_decay: float          = 5.0
 ) -> Image.Image:
     """
     Args:
-        image               : Original PIL image
-        mask                : PIL image (white=inpaint) or numpy array (1=inpaint)
-        prompt              : Text describing what to generate in the masked region
-        tokenizer/text_encoder/vae/unet/scheduler: pre-loaded model components
-        num_inference_steps : Reverse diffusion steps (more = better quality, slower)
-        guidance_scale      : CFG strength — higher follows prompt more strictly
-        seed                : Random seed for reproducibility
-        inject_attention    : Whether to use self-attention feature injection
-        injection_end       : Fraction of timesteps after which injection stops.
-                              Early/mid steps benefit most; late steps can be left free
-                              so fine details aren't over-constrained by the reference.
-    Returns:
-        Inpainted PIL Image with postprocessing applied
+        inject_attention    : Whether to use self-attention feature injection.
+        injection_end       : Fraction of total steps after which strength is forced to 0.
+        injection_schedule  : How strength decays from 1.0 to 0.0 within [0, injection_end].
+                              "step"   — original hard cutoff (full strength until injection_end, then off)
+                              "linear" — linearly decays from 1.0 to 0.0
+                              "cosine" — smooth cosine decay (recommended default)
+                              "exp"    — exponential decay, fast drop; steepness set by exp_decay
+        exp_decay           : Decay rate for the "exp" schedule. Higher = faster drop.
+                              Typical range: 2.0 (gentle) to 8.0 (steep).
     """
     scheduler.set_timesteps(num_inference_steps)
     generator = torch.Generator(device=device).manual_seed(seed)
@@ -298,8 +278,13 @@ def repaint_inpainting(
 
     for step_idx, t in enumerate(tqdm(scheduler.timesteps, desc="Inpainting")):
 
-        progress = step_idx / total_steps
-        should_inject = inject_attention and progress < injection_end
+        strength = 0.0
+        if inject_attention:
+            strength = compute_injection_strength(
+                step_idx, total_steps, injection_end, injection_schedule, exp_decay
+            )
+
+        should_inject = strength > 0.0
 
         if should_inject:
             t_int = t.item() if hasattr(t, "item") else int(t)
@@ -307,12 +292,14 @@ def repaint_inpainting(
             noise = torch.randn_like(original_latent, dtype=unet.dtype)
             original_at_t = (alpha_bar ** 0.5) * original_latent + ((1 - alpha_bar) ** 0.5) * noise
 
-            attn_store.enable(mask_latent)
+            attn_store.enable(mask_latent, strength=strength)
             unet_input = scheduler.scale_model_input(
                 torch.cat([x_t, x_t, original_at_t], dim=0), t
             ).to(dtype=unet.dtype)
             embeddings = torch.cat([text_embeddings, text_embeddings[0:1]], dim=0)
         else:
+            if inject_attention:
+                attn_store.disable()
             unet_input = scheduler.scale_model_input(
                 torch.cat([x_t, x_t], dim=0), t
             ).to(dtype=unet.dtype)
@@ -348,11 +335,6 @@ def repaint_inpainting(
 
 
 def load_triplets(images_dir: str, masks_dir: str, prompts_dir: str):
-    """
-    Loads matching (image, mask, prompt) triplets from three directories.
-    Files are matched by filename stem — e.g. desk.jpg / desk.png / desk.txt.
-    Skips stems that don't have all three files.
-    """
     images_dir  = Path(images_dir)
     masks_dir   = Path(masks_dir)
     prompts_dir = Path(prompts_dir)
@@ -385,24 +367,33 @@ def load_triplets(images_dir: str, masks_dir: str, prompts_dir: str):
     return triplets
 
 
+VARIANTS = [
+    {"name": "step",    "injection_schedule": "step",   "exp_decay": 5.0},
+    {"name": "linear",  "injection_schedule": "linear", "exp_decay": 5.0},
+    {"name": "cosine",  "injection_schedule": "cosine", "exp_decay": 5.0},
+    {"name": "exp2",    "injection_schedule": "exp",    "exp_decay": 2.0},
+    {"name": "exp8",    "injection_schedule": "exp",    "exp_decay": 8.0},
+]
+
+
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — batch directory mode")
-    parser.add_argument("--images",  type=str, required=True,     help="Directory of input images (.jpg/.png)")
-    parser.add_argument("--masks",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
-    parser.add_argument("--prompts", type=str, required=True,     help="Directory of prompt .txt files")
-    parser.add_argument("--output",  type=str, default="results", help="Directory to save results")
-    parser.add_argument("--steps",            type=int,   default=50,   help="Diffusion steps (default: 50)")
-    parser.add_argument("--guidance",          type=float, default=7.5,  help="CFG guidance scale (default: 7.5)")
-    parser.add_argument("--seed",              type=int,   default=42,   help="Base random seed (default: 42)")
-    parser.add_argument("--device",            type=str,   default="cuda", help="cuda or cpu (default: cuda)")
-    parser.add_argument("--no-inject",         action="store_true",      help="Disable self-attention injection")
-    parser.add_argument("--injection-end",     type=float, default=0.7,  help="Fraction of steps to inject attention for (default: 0.7)")
+    parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — multi-schedule comparison mode")
+    parser.add_argument("--images",        type=str, required=True,    help="Directory of input images (.jpg/.png)")
+    parser.add_argument("--masks",         type=str, required=True,    help="Directory of mask images (white=inpaint, black=keep)")
+    parser.add_argument("--prompts",       type=str, required=True,    help="Directory of prompt .txt files")
+    parser.add_argument("--output",        type=str, default="results", help="Root output directory (default: results)")
+    parser.add_argument("--steps",         type=int,   default=50,     help="Diffusion steps (default: 50)")
+    parser.add_argument("--guidance",      type=float, default=7.5,    help="CFG guidance scale (default: 7.5)")
+    parser.add_argument("--seed",          type=int,   default=42,     help="Base random seed (default: 42)")
+    parser.add_argument("--device",        type=str,   default="cuda", help="cuda or cpu (default: cuda)")
+    parser.add_argument("--injection-end", type=float, default=0.7,    help="Fraction of steps to inject attention for (default: 0.7)")
     args = parser.parse_args()
 
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    root_dir = Path(args.output)
+    for v in VARIANTS:
+        (root_dir / f"Results-{v['name']}").mkdir(parents=True, exist_ok=True)
 
     print("Scanning directories for matching triplets...")
     triplets = load_triplets(args.images, args.masks, args.prompts)
@@ -412,30 +403,32 @@ if __name__ == "__main__":
 
     for i, triplet in enumerate(triplets):
         name, image, mask, prompt = triplet["name"], triplet["image"], triplet["mask"], triplet["prompt"]
-        print(f"\n[{i+1}/{len(triplets)}] Processing '{name}' ...")
+        per_image_seed = args.seed + i
+        print(f"\n[{i+1}/{len(triplets)}] Processing '{name}' — seed {per_image_seed}")
         print(f"  Prompt: \"{prompt}\"")
 
-        per_image_seed = args.seed + i
-        result = repaint_inpainting(
-            image               = image,
-            mask                = mask,
-            prompt              = prompt,
-            tokenizer           = tokenizer,
-            text_encoder        = text_encoder,
-            vae                 = vae,
-            unet                = unet,
-            scheduler           = scheduler,
-            num_inference_steps = args.steps,
-            guidance_scale      = args.guidance,
-            seed                = per_image_seed,
-            device              = args.device,
-            inject_attention    = not args.no_inject,
-            injection_end       = args.injection_end
-        )
-        print(f"  Seed: {per_image_seed}")
+        for v in VARIANTS:
+            print(f"  -> Schedule: {v['name']}")
+            result = repaint_inpainting(
+                image                = image,
+                mask                 = mask,
+                prompt               = prompt,
+                tokenizer            = tokenizer,
+                text_encoder         = text_encoder,
+                vae                  = vae,
+                unet                 = unet,
+                scheduler            = scheduler,
+                num_inference_steps  = args.steps,
+                guidance_scale       = args.guidance,
+                seed                 = per_image_seed,
+                device               = args.device,
+                inject_attention     = True,
+                injection_end        = args.injection_end,
+                injection_schedule   = v["injection_schedule"],
+                exp_decay            = v["exp_decay"]
+            )
+            out_path = root_dir / f"Results-{v['name']}" / f"{name}_result.png"
+            result.save(out_path)
+            print(f"     Saved -> {out_path}")
 
-        out_path = output_dir / f"{name}_result.png"
-        result.save(out_path)
-        print(f"  Saved -> {out_path}")
-
-    print(f"\nDone! All results saved to: {output_dir}/")
+    print(f"\nDone! All results saved under: {root_dir}/")
