@@ -21,7 +21,6 @@ def load_pipeline_components(
         device: str = "cuda"
 ):
     print(f"Loading model components from '{model_id}' ...")
-    # Use fp16 on CUDA for ~4x speedup with minimal quality loss
     dtype = torch.float16 if device == "cuda" else torch.float32
     tokenizer    = CLIPTokenizer.from_pretrained(model_id, subfolder="tokenizer")
     text_encoder = CLIPTextModel.from_pretrained(model_id, subfolder="text_encoder", torch_dtype=dtype).to(device)
@@ -39,7 +38,6 @@ def load_pipeline_components(
 
 
 def preprocess_image(image: Image.Image, resolution: int = 512) -> torch.Tensor:
-    """Returns (1, 3, H, W) tensor in [-1, 1]."""
     image = image.convert("RGB").resize((resolution, resolution), Image.LANCZOS)
     arr   = np.array(image).astype(np.float32) / 255.0
     arr   = arr * 2.0 - 1.0
@@ -47,10 +45,6 @@ def preprocess_image(image: Image.Image, resolution: int = 512) -> torch.Tensor:
 
 
 def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
-    """
-    Returns (1, 1, H//8, W//8) binary tensor: 1=inpaint, 0=keep.
-    Downscaled to latent resolution (VAE compresses by 8x).
-    """
     latent_res = resolution // 8
 
     if isinstance(mask, np.ndarray):
@@ -59,7 +53,6 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
     else:
-        # PIL: white(255) -> 1=inpaint, black(0) -> 0=keep
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
@@ -68,8 +61,6 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
 
 
 def encode_image_to_latent(image_tensor: torch.Tensor, vae: AutoencoderKL, device: str) -> torch.Tensor:
-    """Encodes pixel image to VAE latent space. Returns (1, 4, H//8, W//8)."""
-    # Cast to same dtype as VAE (fp16 on CUDA)
     image_tensor = image_tensor.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         latent = vae.encode(image_tensor).latent_dist.sample()
@@ -78,8 +69,7 @@ def encode_image_to_latent(image_tensor: torch.Tensor, vae: AutoencoderKL, devic
 
 
 def decode_latent_to_image(latent: torch.Tensor, vae: AutoencoderKL, device: str) -> Image.Image:
-    """Decodes VAE latent back to a PIL image."""
-    latent = latent.to(device=device, dtype=vae.dtype)  # ensure fp16
+    latent = latent.to(device=device, dtype=vae.dtype)
     with torch.no_grad():
         image_tensor = vae.decode(latent / vae.config.scaling_factor).sample
     image_tensor = image_tensor.squeeze(0).permute(1, 2, 0)
@@ -88,11 +78,6 @@ def decode_latent_to_image(latent: torch.Tensor, vae: AutoencoderKL, device: str
 
 
 def encode_text_prompt(prompt: str, tokenizer: CLIPTokenizer, text_encoder: CLIPTextModel, device: str) -> torch.Tensor:
-    """
-    Returns stacked CLIP embeddings (2, 77, 1024):
-        [0] = conditional (real prompt), [1] = unconditional (empty string)
-    Both are needed for Classifier-Free Guidance (CFG).
-    """
     tokens = tokenizer(
         [prompt, ""],
         padding="max_length",
@@ -105,50 +90,51 @@ def encode_text_prompt(prompt: str, tokenizer: CLIPTokenizer, text_encoder: CLIP
     return embeddings
 
 
-def postprocess(result_image: Image.Image, original_image: Image.Image, mask, resolution: int = 512) -> Image.Image:
-    """
-    Hard pixel swap: for every pixel where mask is NOT white, replace the
-    result pixel with the exact original pixel, regardless of result value.
-    White mask pixels (inpaint region) are left untouched.
-    """
-    # Resize both images to pipeline resolution
-    orig_np   = np.array(original_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
-    result_np = np.array(result_image)
-
-    # Build binary bitmap from mask
+def _mask_to_numpy(mask, resolution: int) -> np.ndarray:
+    """Returns a (H, W) uint8 array at pipeline resolution: 255=inpaint, 0=keep."""
     if isinstance(mask, np.ndarray):
-        mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
+        pil_mask = Image.fromarray((mask * 255).astype(np.uint8))
     else:
-        mask_pil = mask.convert("RGB")
-    mask_np = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
-
-    # CHANGED: A pixel is "white" (inpaint) if all channels are above threshold 250
-    is_white = np.all(mask_np > 250, axis=2)  # (H, W) bool, True=inpaint
-
-    # Hard swap: wherever is_white is False (keep region), use original pixel exactly
-    output_np = result_np.copy()
-    output_np[~is_white] = orig_np[~is_white]
-
-    return Image.fromarray(output_np)
+        pil_mask = mask.convert("L")
+    arr = np.array(pil_mask.resize((resolution, resolution), Image.NEAREST))
+    return np.where(arr > 127, 255, 0).astype(np.uint8)
 
 
-def poisson_blend(result_np: np.ndarray, original_np: np.ndarray, mask_np: np.ndarray) -> np.ndarray:
-    mask_u8 = np.where(mask_np > 127, 255, 0).astype(np.uint8)
-
+def poisson_blend(result_np: np.ndarray, original_np: np.ndarray, mask_u8: np.ndarray) -> np.ndarray:
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return result_np
 
-    x, y, w, h = cv2.boundingRect(np.concatenate(contours))
-    cx = x + w // 2
-    cy = y + h // 2
+    white_yx = np.argwhere(mask_u8 > 127)
+    if white_yx.size == 0:
+        return result_np
+    cy = int(white_yx[:, 0].mean())
+    cx = int(white_yx[:, 1].mean())
 
     try:
-        blended = cv2.seamlessClone(result_np, original_np, mask_u8, (cx, cy), cv2.NORMAL_CLONE)
+        return cv2.seamlessClone(result_np, original_np, mask_u8, (cx, cy), cv2.NORMAL_CLONE)
     except cv2.error:
         return result_np
 
-    return blended
+
+def postprocess(
+        result_image: Image.Image,
+        original_image: Image.Image,
+        mask,
+        resolution: int = 512,
+        use_poisson_blend: bool = False
+) -> Image.Image:
+    orig_np   = np.array(original_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
+    result_np = np.array(result_image)
+    mask_u8   = _mask_to_numpy(mask, resolution)
+    is_inpaint = mask_u8 > 127
+
+    result_np[~is_inpaint] = orig_np[~is_inpaint]
+
+    if use_poisson_blend:
+        result_np = poisson_blend(result_np, orig_np, mask_u8)
+
+    return Image.fromarray(result_np)
 
 
 def repaint_inpainting(
@@ -167,18 +153,6 @@ def repaint_inpainting(
         device: str               = "cuda",
         use_poisson_blend: bool   = True
 ) -> Image.Image:
-    """
-    Args:
-        image               : Original PIL image
-        mask                : PIL image (white=inpaint) or numpy array (1=inpaint)
-        prompt              : Text describing what to generate in the masked region
-        tokenizer/text_encoder/vae/unet/scheduler: pre-loaded model components
-        num_inference_steps : Reverse diffusion steps (more = better quality, slower)
-        guidance_scale      : CFG strength — higher follows prompt more strictly
-        seed                : Random seed for reproducibility
-    Returns:
-        Inpainted PIL Image with postprocessing applied
-    """
     scheduler.set_timesteps(num_inference_steps)
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -187,63 +161,40 @@ def repaint_inpainting(
     original_latent = encode_image_to_latent(image_tensor, vae, device)
     text_embeddings = encode_text_prompt(prompt, tokenizer, text_encoder, device)
 
-    # Start from pure Gaussian noise (x_T), cast to model dtype (fp16 on CUDA)
     x_t = torch.randn(original_latent.shape, generator=generator, device=device, dtype=unet.dtype)
     x_t = x_t * scheduler.init_noise_sigma
 
     for t in tqdm(scheduler.timesteps, desc="Inpainting"):
 
-        # CFG: run UNet with both conditional and unconditional embeddings in one pass
         unet_input = scheduler.scale_model_input(torch.cat([x_t, x_t], dim=0), t)
-        unet_input = unet_input.to(dtype=unet.dtype)  # ensure fp16
+        unet_input = unet_input.to(dtype=unet.dtype)
         with torch.no_grad():
             noise_pred = unet(unet_input, t, encoder_hidden_states=text_embeddings).sample
 
-        # Combine conditional and unconditional predictions
         noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        # Scheduler step: remove predicted noise to get x_{t-1}
         x_t_minus_1 = scheduler.step(noise_pred, t, x_t).prev_sample
 
-        # Re-noise original to level t-1: x_{t-1} = sqrt(a)*x0 + sqrt(1-a)*eps
-        current_idx = (scheduler.timesteps == t).nonzero().item()
-        t_prev = scheduler.timesteps[current_idx + 1].item() if current_idx + 1 < len(scheduler.timesteps) else 0
+        current_idx    = (scheduler.timesteps == t).nonzero().item()
+        t_prev         = scheduler.timesteps[current_idx + 1].item() if current_idx + 1 < len(scheduler.timesteps) else 0
         alpha_bar_prev = scheduler.alphas_cumprod[t_prev]
-        noise = torch.randn_like(original_latent, dtype=unet.dtype)
+        noise          = torch.randn_like(original_latent, dtype=unet.dtype)
 
         if t_prev > 0:
             original_at_t_minus_1 = (alpha_bar_prev ** 0.5) * original_latent + ((1 - alpha_bar_prev) ** 0.5) * noise
         else:
             original_at_t_minus_1 = original_latent
 
-        # RePaint blend: masked region from UNet, unmasked from re-noised original
         x_t = (mask_latent * x_t_minus_1) + ((1 - mask_latent) * original_at_t_minus_1)
 
     result_image = decode_latent_to_image(x_t, vae, device)
-
-    result_image = postprocess(result_image, image, mask, resolution)
-
-    if use_poisson_blend:
-        orig_np   = np.array(image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
-        result_np = np.array(result_image)
-        if isinstance(mask, np.ndarray):
-            mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
-        else:
-            mask_pil = mask.convert("L")
-        mask_np   = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
-        result_np = poisson_blend(result_np, orig_np, mask_np)
-        result_image = Image.fromarray(result_np)
+    result_image = postprocess(result_image, image, mask, resolution, use_poisson_blend=use_poisson_blend)
 
     return result_image
 
 
 def load_triplets(images_dir: str, masks_dir: str, prompts_dir: str):
-    """
-    Loads matching (image, mask, prompt) triplets from three directories.
-    Files are matched by filename stem — e.g. desk.jpg / desk.png / desk.txt.
-    Skips stems that don't have all three files.
-    """
     images_dir  = Path(images_dir)
     masks_dir   = Path(masks_dir)
     prompts_dir = Path(prompts_dir)
@@ -280,15 +231,15 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — batch directory mode")
-    parser.add_argument("--images",  type=str, required=True,     help="Directory of input images (.jpg/.png)")
-    parser.add_argument("--masks",   type=str, required=True,     help="Directory of mask images (white=inpaint, black=keep)")
-    parser.add_argument("--prompts", type=str, required=True,     help="Directory of prompt .txt files")
-    parser.add_argument("--output",  type=str, default="results", help="Directory to save results")
-    parser.add_argument("--steps",       type=int,   default=50,      help="Diffusion steps (default: 50)")
-    parser.add_argument("--guidance",    type=float, default=7.5,     help="CFG guidance scale (default: 7.5)")
-    parser.add_argument("--seed",        type=int,   default=42,      help="Random seed (default: 42)")
-    parser.add_argument("--device",      type=str,   default="cuda",  help="cuda or cpu (default: cuda)")
-    parser.add_argument("--no-poisson",  action="store_true",         help="Disable Poisson blending")
+    parser.add_argument("--images",     type=str, required=True,    help="Directory of input images (.jpg/.png)")
+    parser.add_argument("--masks",      type=str, required=True,    help="Directory of mask images (white=inpaint, black=keep)")
+    parser.add_argument("--prompts",    type=str, required=True,    help="Directory of prompt .txt files")
+    parser.add_argument("--output",     type=str, default="results", help="Directory to save results")
+    parser.add_argument("--steps",      type=int,   default=50,     help="Diffusion steps (default: 50)")
+    parser.add_argument("--guidance",   type=float, default=7.5,    help="CFG guidance scale (default: 7.5)")
+    parser.add_argument("--seed",       type=int,   default=42,     help="Random seed (default: 42)")
+    parser.add_argument("--device",     type=str,   default="cuda", help="cuda or cpu (default: cuda)")
+    parser.add_argument("--no-poisson", action="store_true",        help="Disable Poisson blending")
     args = parser.parse_args()
 
     output_dir = Path(args.output)
