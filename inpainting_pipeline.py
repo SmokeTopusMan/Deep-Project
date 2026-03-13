@@ -23,8 +23,8 @@ class AttentionStore:
         self.unet          = unet
         self._mode         = False
         self._strength     = 1.0
-        self._mask_latent: torch.Tensor = None
-        self._mask_cache: dict[int, torch.Tensor] = {}
+        self._mask_latent  = None
+        self._mask_cache   = {}
         self._hooks        = []
         self._register_hooks()
 
@@ -40,11 +40,9 @@ class AttentionStore:
         def hook(module, args, kwargs, output):
             if not self._mode:
                 return output
-
             hidden = args[0] if args else kwargs.get("hidden_states")
             if hidden is None:
                 return output
-
             B, seq, dim = hidden.shape
 
             def split(x):
@@ -81,7 +79,6 @@ class AttentionStore:
             out = module.to_out[0](out)
             out = module.to_out[1](out)
             return out
-
         return hook
 
     def _get_spatial_mask(self, seq_len: int, device, dtype) -> torch.Tensor:
@@ -168,7 +165,6 @@ def preprocess_image(image: Image.Image, resolution: int = 512) -> torch.Tensor:
 
 def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
     latent_res = resolution // 8
-
     if isinstance(mask, np.ndarray):
         pil_mask = Image.fromarray((mask * 255).astype(np.uint8))
         pil_mask = pil_mask.resize((latent_res, latent_res), Image.NEAREST)
@@ -178,7 +174,6 @@ def preprocess_mask(mask, resolution: int = 512) -> torch.Tensor:
         pil_mask = mask.convert("L").resize((latent_res, latent_res), Image.NEAREST)
         arr = np.array(pil_mask).astype(np.float32) / 255.0
         arr = (arr > 0.5).astype(np.float32)
-
     return torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
 
 
@@ -215,18 +210,14 @@ def encode_text_prompt(prompt: str, tokenizer: CLIPTokenizer, text_encoder: CLIP
 def postprocess(result_image: Image.Image, original_image: Image.Image, mask, resolution: int = 512) -> Image.Image:
     orig_np   = np.array(original_image.convert("RGB").resize((resolution, resolution), Image.LANCZOS))
     result_np = np.array(result_image)
-
     if isinstance(mask, np.ndarray):
         mask_pil = Image.fromarray((mask * 255).astype(np.uint8))
     else:
         mask_pil = mask.convert("RGB")
-    mask_np = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
-
+    mask_np  = np.array(mask_pil.resize((resolution, resolution), Image.NEAREST))
     is_white = np.all(mask_np > 250, axis=2)
-
     output_np = result_np.copy()
     output_np[~is_white] = orig_np[~is_white]
-
     return Image.fromarray(output_np)
 
 
@@ -246,21 +237,9 @@ def repaint_inpainting(
         device: str               = "cuda",
         inject_attention: bool    = True,
         injection_end: float      = 0.7,
-        injection_schedule: str   = "cosine",
+        injection_schedule: str   = "step",
         exp_decay: float          = 5.0
 ) -> Image.Image:
-    """
-    Args:
-        inject_attention    : Whether to use self-attention feature injection.
-        injection_end       : Fraction of total steps after which strength is forced to 0.
-        injection_schedule  : How strength decays from 1.0 to 0.0 within [0, injection_end].
-                              "step"   — original hard cutoff (full strength until injection_end, then off)
-                              "linear" — linearly decays from 1.0 to 0.0
-                              "cosine" — smooth cosine decay (recommended default)
-                              "exp"    — exponential decay, fast drop; steepness set by exp_decay
-        exp_decay           : Decay rate for the "exp" schedule. Higher = faster drop.
-                              Typical range: 2.0 (gentle) to 8.0 (steep).
-    """
     scheduler.set_timesteps(num_inference_steps)
     generator = torch.Generator(device=device).manual_seed(seed)
 
@@ -272,8 +251,8 @@ def repaint_inpainting(
     x_t = torch.randn(original_latent.shape, generator=generator, device=device, dtype=unet.dtype)
     x_t = x_t * scheduler.init_noise_sigma
 
-    attn_store = AttentionStore(unet) if inject_attention else None
-    total_steps = len(scheduler.timesteps)
+    attn_store     = AttentionStore(unet) if inject_attention else None
+    total_steps    = len(scheduler.timesteps)
     timesteps_list = list(scheduler.timesteps)
 
     for step_idx, t in enumerate(tqdm(scheduler.timesteps, desc="Inpainting")):
@@ -287,9 +266,9 @@ def repaint_inpainting(
         should_inject = strength > 0.0
 
         if should_inject:
-            t_int = t.item() if hasattr(t, "item") else int(t)
+            t_int     = t.item() if hasattr(t, "item") else int(t)
             alpha_bar = scheduler.alphas_cumprod[t_int]
-            noise = torch.randn_like(original_latent, dtype=unet.dtype)
+            noise     = torch.randn_like(original_latent, dtype=unet.dtype)
             original_at_t = (alpha_bar ** 0.5) * original_latent + ((1 - alpha_bar) ** 0.5) * noise
 
             attn_store.enable(mask_latent, strength=strength)
@@ -315,11 +294,10 @@ def repaint_inpainting(
         noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
-        x_t_minus_1 = scheduler.step(noise_pred, t, x_t).prev_sample
-
-        t_prev = timesteps_list[step_idx + 1].item() if step_idx + 1 < len(timesteps_list) else 0
+        x_t_minus_1    = scheduler.step(noise_pred, t, x_t).prev_sample
+        t_prev         = timesteps_list[step_idx + 1].item() if step_idx + 1 < len(timesteps_list) else 0
         alpha_bar_prev = scheduler.alphas_cumprod[t_prev]
-        noise = torch.randn_like(original_latent, dtype=unet.dtype)
+        noise          = torch.randn_like(original_latent, dtype=unet.dtype)
 
         if t_prev > 0:
             original_at_t_minus_1 = (alpha_bar_prev ** 0.5) * original_latent + ((1 - alpha_bar_prev) ** 0.5) * noise
@@ -330,7 +308,6 @@ def repaint_inpainting(
 
     result_image = decode_latent_to_image(x_t, vae, device)
     result_image = postprocess(result_image, image, mask, resolution)
-
     return result_image
 
 
@@ -368,27 +345,27 @@ def load_triplets(images_dir: str, masks_dir: str, prompts_dir: str):
 
 
 VARIANTS = [
-    {"name": "step",    "injection_schedule": "step",   "exp_decay": 5.0},
-    {"name": "linear",  "injection_schedule": "linear", "exp_decay": 5.0},
-    {"name": "cosine",  "injection_schedule": "cosine", "exp_decay": 5.0},
-    {"name": "exp2",    "injection_schedule": "exp",    "exp_decay": 2.0},
-    {"name": "exp8",    "injection_schedule": "exp",    "exp_decay": 8.0},
+    {"name": "end30", "injection_end": 0.3},
+    {"name": "end40", "injection_end": 0.4},
+    {"name": "end50", "injection_end": 0.5},
+    {"name": "end60", "injection_end": 0.6},
+    {"name": "end70", "injection_end": 0.7},
+    {"name": "end80", "injection_end": 0.8},
 ]
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — multi-schedule comparison mode")
-    parser.add_argument("--images",        type=str, required=True,    help="Directory of input images (.jpg/.png)")
-    parser.add_argument("--masks",         type=str, required=True,    help="Directory of mask images (white=inpaint, black=keep)")
-    parser.add_argument("--prompts",       type=str, required=True,    help="Directory of prompt .txt files")
-    parser.add_argument("--output",        type=str, default="results", help="Root output directory (default: results)")
-    parser.add_argument("--steps",         type=int,   default=50,     help="Diffusion steps (default: 50)")
-    parser.add_argument("--guidance",      type=float, default=7.5,    help="CFG guidance scale (default: 7.5)")
-    parser.add_argument("--seed",          type=int,   default=42,     help="Base random seed (default: 42)")
-    parser.add_argument("--device",        type=str,   default="cuda", help="cuda or cpu (default: cuda)")
-    parser.add_argument("--injection-end", type=float, default=0.7,    help="Fraction of steps to inject attention for (default: 0.7)")
+    parser = argparse.ArgumentParser(description="RePaint inpainting with SD2-base — injection_end sweep mode")
+    parser.add_argument("--images",   type=str, required=True,      help="Directory of input images (.jpg/.png)")
+    parser.add_argument("--masks",    type=str, required=True,      help="Directory of mask images (white=inpaint, black=keep)")
+    parser.add_argument("--prompts",  type=str, required=True,      help="Directory of prompt .txt files")
+    parser.add_argument("--output",   type=str, default="results",  help="Root output directory (default: results)")
+    parser.add_argument("--steps",    type=int,   default=50,       help="Diffusion steps (default: 50)")
+    parser.add_argument("--guidance", type=float, default=7.5,      help="CFG guidance scale (default: 7.5)")
+    parser.add_argument("--seed",     type=int,   default=42,       help="Base random seed (default: 42)")
+    parser.add_argument("--device",   type=str,   default="cuda",   help="cuda or cpu (default: cuda)")
     args = parser.parse_args()
 
     root_dir = Path(args.output)
@@ -408,7 +385,7 @@ if __name__ == "__main__":
         print(f"  Prompt: \"{prompt}\"")
 
         for v in VARIANTS:
-            print(f"  -> Schedule: {v['name']}")
+            print(f"  -> injection_end={v['injection_end']}")
             result = repaint_inpainting(
                 image                = image,
                 mask                 = mask,
@@ -423,9 +400,9 @@ if __name__ == "__main__":
                 seed                 = per_image_seed,
                 device               = args.device,
                 inject_attention     = True,
-                injection_end        = args.injection_end,
-                injection_schedule   = v["injection_schedule"],
-                exp_decay            = v["exp_decay"]
+                injection_end        = v["injection_end"],
+                injection_schedule   = "step",
+                exp_decay            = 5.0
             )
             out_path = root_dir / f"Results-{v['name']}" / f"{name}_result.png"
             result.save(out_path)
