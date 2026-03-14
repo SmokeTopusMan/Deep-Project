@@ -345,12 +345,7 @@ def load_triplets(images_dir: str, masks_dir: str, prompts_dir: str):
 
 
 VARIANTS = [
-    {"name": "end30", "injection_end": 0.3},
-    {"name": "end40", "injection_end": 0.4},
-    {"name": "end50", "injection_end": 0.5},
-    {"name": "end60", "injection_end": 0.6},
     {"name": "end70", "injection_end": 0.7},
-    {"name": "end80", "injection_end": 0.8},
 ]
 
 
