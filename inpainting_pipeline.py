@@ -291,7 +291,7 @@ def repaint_inpainting(
             attn_store.disable()
             noise_pred = noise_pred[:2]
 
-        noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
+        noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
 
         x_t_minus_1    = scheduler.step(noise_pred, t, x_t).prev_sample
